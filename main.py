@@ -1,38 +1,10 @@
 #!/usr/bin/env python3
-"""
-Frequency-only AoA estimation with a Region-Aware GNN (frequency grouping only) + MUSIC teacher labels
-Teacher and student use the SAME frequency grouping (0 / 5 / 10), and BOTH use
-"covariance averaged over subcarriers inside each group" (cov-avg), to avoid band×time mixing issues.
-
-Key changes vs earlier version:
-- Teacher MUSIC per group uses covariance-averaging across subcarriers in that group (more consistent).
-- Student node features also use covariance-averaging across subcarriers in that group.
-- Output is normalized to unit circle (valid [cos,sin]).
-- Loss is angular (cosine) loss (prevents boundary collapse).
-
-Grouping meaning (for K=50):
-  --grouping 0   => 50 nodes (one per subcarrier)
-  --grouping 5   => 5 nodes  (10 subcarriers per band)
-  --grouping 10  => 10 nodes (5 subcarriers per band)
-
-Saves under:
-  {output_dir}/{experiment_name}_group{grouping}/
-      data/              slice_{g}_music_grouped.mat
-      gnn_data/          gnn_model_state.pt, gnn_predictions.npy
-      gnn_figure/        slice_{g}_gnn_music_comparison.png
-      metrics.csv
-      time_comparison_plot.png
-      DoA_GNN_vs_MUSIC_teacher_after_start_sample.png
-
-Requirements:
-  numpy, scipy, matplotlib, pandas
-  torch
-  torch-geometric
-"""
+# -*- coding: utf-8 -*-
 
 import os
 import time
 import glob
+import json
 import argparse
 import numpy as np
 import pandas as pd
@@ -64,9 +36,8 @@ def find_specified_peaks(phi, PS, L):
 
 def music(a, R, phi, L):
     PS = np.zeros(a.shape[1], dtype=complex)
-    # eigendecomposition
     D, Q = np.linalg.eigh(R)
-    Qn = Q[:, 0 : R.shape[0] - L]  # noise subspace
+    Qn = Q[:, 0: R.shape[0] - L]
     Rn = Qn @ np.conj(Qn.T)
     for t in range(len(phi)):
         a_tmp = np.reshape(a[:, t], (-1, 1))
@@ -75,23 +46,8 @@ def music(a, R, phi, L):
 
 
 # --------------------------------------
-# Frequency grouping
+# Covariance -> feature
 # --------------------------------------
-def make_freq_groups(K: int, grouping: int):
-    """
-    grouping=0  -> each subcarrier is its own node: [(0,1),(1,2),...]
-    grouping=5  -> 5 groups total (K/5 per group)
-    grouping=10 -> 10 groups total (K/10 per group)
-    """
-    if grouping == 0:
-        return [(k, k + 1) for k in range(K)]
-    if grouping <= 0:
-        raise ValueError("grouping must be 0, 5, or 10 (or any positive divisor of K).")
-    assert K % grouping == 0, f"K={K} must be divisible by grouping={grouping}"
-    step = K // grouping
-    return [(i * step, (i + 1) * step) for i in range(grouping)]
-
-
 def cov_to_feature(R: np.ndarray, trace_norm: bool = True) -> np.ndarray:
     """Convert covariance matrix to [Re, Im] flattened feature."""
     if trace_norm:
@@ -102,55 +58,175 @@ def cov_to_feature(R: np.ndarray, trace_norm: bool = True) -> np.ndarray:
     return feat.astype(np.float32)
 
 
-def cov_avg_over_subcarriers(CSI: np.ndarray, ant_start: int, M: int, k0: int, k1: int,
-                             start_idx: int, n_samples: int) -> np.ndarray:
+def cov_avg_over_subcarriers_list(CSI: np.ndarray, ant_start: int, M: int, sc_list,
+                                  start_idx: int, n_samples: int) -> np.ndarray:
     """
-    Average covariance across subcarriers in [k0,k1).
+    Average covariance across explicit subcarrier indices in sc_list.
     CSI: [num_ant_total, num_subcarriers, T]
     Returns complex covariance (M,M)
     """
     R_sum = np.zeros((M, M), dtype=np.complex128)
-    count = 0
-    for sc in range(k0, k1):
+    for sc in sc_list:
         x = np.squeeze(CSI[ant_start: ant_start + M, sc, start_idx: start_idx + n_samples])  # (M,n_samples)
-        # covariance across time snapshots
         R = (x @ np.conjugate(x.T)) / (x.shape[1] + 1e-9)
         R_sum += R
-        count += 1
-    return R_sum / max(1, count)
+    return R_sum / max(1, len(sc_list))
 
 
 # --------------------------------------
-# Grouping-correct MUSIC teacher (cov-avg)
+# Correlation-based subcarrier selection + grouping
 # --------------------------------------
-def music_teacher_grouped_covavg(CSI, ant_start, M, groups, start_idx, n_samples, phi, L, lam, d,
-                                 agg="mean"):
+def corr_similarity_matrix(X: np.ndarray, use_abs: bool = True) -> np.ndarray:
     """
-    For each group:
+    X: (K,F) signatures
+    sim(i,j) = corr(X[i], X[j]) (implemented via normalized dot after mean-centering)
+    """
+    Xc = X - X.mean(axis=1, keepdims=True)
+    Xn = Xc / (np.linalg.norm(Xc, axis=1, keepdims=True) + 1e-9)
+    sim = Xn @ Xn.T
+    if use_abs:
+        sim = np.abs(sim)
+    np.fill_diagonal(sim, 0.0)
+    return sim
+
+
+def compute_subcarrier_signatures_trainonly(
+    CSI: np.ndarray,
+    ant_start: int,
+    M: int,
+    n_samples: int,
+    interval: int,
+    start_sample: int,
+    max_train_slices: int = 200,
+    trace_norm: bool = True
+) -> np.ndarray:
+    """
+    Build per-subcarrier signature vectors from TRAIN region only (start_idx < start_sample).
+    Signature for subcarrier k: average over training slices of cov_to_feature(R_k(slice)).
+    Returns sigs: (K,F) float32
+    """
+    K = CSI.shape[1]
+    T = CSI.shape[2]
+    total_slices = (T - n_samples) // interval
+    if total_slices <= 0:
+        raise RuntimeError(f"Not enough CSI length={T} for window_size={n_samples}, stride={interval}")
+
+    # collect training slice indices (g) such that start_idx < start_sample
+    train_g = []
+    for g in range(total_slices):
+        start_idx = g * interval
+        if start_idx < start_sample:
+            train_g.append(g)
+    if len(train_g) == 0:
+        raise RuntimeError(
+            f"No training slices for selection (start_sample={start_sample}). "
+            f"Try increasing start_sample or reducing window/stride."
+        )
+
+    use_slices = train_g[:min(len(train_g), max_train_slices)]
+
+    sig_sum = None
+    count = 0
+
+    for g in use_slices:
+        start_idx = g * interval
+        feats = []
+        for k in range(K):
+            x = np.squeeze(CSI[ant_start: ant_start + M, k, start_idx: start_idx + n_samples])
+            R = (x @ np.conjugate(x.T)) / (x.shape[1] + 1e-9)
+            fk = cov_to_feature(R, trace_norm=trace_norm)
+            feats.append(fk)
+        feats = np.stack(feats, axis=0)  # (K,F)
+
+        if sig_sum is None:
+            sig_sum = feats.astype(np.float64)
+        else:
+            sig_sum += feats.astype(np.float64)
+        count += 1
+
+    sigs = (sig_sum / max(1, count)).astype(np.float32)
+    return sigs
+
+
+def select_strong_subcarriers(sim: np.ndarray, n_select: int = 20, top_p: int = 10):
+    """
+    Choose subcarriers with high "centrality": score(k) = mean of top_p similarities in row k.
+    Returns selected list and scores array.
+    """
+    K = sim.shape[0]
+    if n_select > K:
+        raise ValueError(f"n_select={n_select} must be <= K={K}")
+    top_p = min(top_p, K - 1)
+    scores = np.zeros(K, dtype=np.float32)
+    for k in range(K):
+        row = sim[k]
+        scores[k] = float(np.mean(np.sort(row)[-top_p:])) if top_p > 0 else 0.0
+    ranked = np.argsort(scores)[::-1]
+    selected = ranked[:n_select].tolist()
+    return selected, scores
+
+
+def greedy_group_by_similarity(selected, sim: np.ndarray, group_size: int = 5):
+    """
+    Given selected subcarriers, create groups of size group_size:
+      - pick anchor with highest avg similarity to other selected
+      - add top (group_size-1) most similar unassigned to anchor
+      - repeat
+    """
+    selected = list(selected)
+    if len(selected) % group_size != 0:
+        raise ValueError(f"len(selected)={len(selected)} must be divisible by group_size={group_size}")
+
+    selected_set = set(selected)
+    sel_list = sorted(selected_set)
+
+    # anchor score within selected set
+    anchor_score = {}
+    for k in sel_list:
+        others = [j for j in sel_list if j != k]
+        anchor_score[k] = float(np.mean([sim[k, j] for j in others])) if others else 0.0
+
+    unassigned = set(sel_list)
+    groups = []
+    while unassigned:
+        anchor = max(unassigned, key=lambda k: anchor_score.get(k, 0.0))
+        unassigned.remove(anchor)
+
+        candidates = sorted(list(unassigned), key=lambda j: sim[anchor, j], reverse=True)
+        take = candidates[: (group_size - 1)]
+        for j in take:
+            unassigned.remove(j)
+        groups.append([anchor] + take)
+
+    return groups
+
+
+# --------------------------------------
+# Grouping-correct MUSIC teacher (list-groups, cov-avg)
+# --------------------------------------
+def music_teacher_grouped_covavg_listgroups(CSI, ant_start, M, groups_sc, start_idx, n_samples,
+                                            phi, L, lam, d, agg="mean"):
+    """
+    For each group (list of subcarrier indices):
       - compute R_band = average_{sc in group} cov(sc)
       - compute PS_band(phi) with MUSIC
     Aggregate PS across groups, then argmax => label.
-
-    Returns: PS_agg (|phi|,), doa_deg, music_time
     """
     k_ant = np.arange(M).reshape((-1, 1))
     a = np.exp(-1j * 2 * np.pi / lam * d * np.outer(k_ant, np.sin(phi)))  # (M, |phi|)
 
     PS_list = []
     t0 = time.time()
-
-    for (k0, k1) in groups:
-        R_band = cov_avg_over_subcarriers(CSI, ant_start, M, k0, k1, start_idx, n_samples)
+    for sc_list in groups_sc:
+        R_band = cov_avg_over_subcarriers_list(CSI, ant_start, M, sc_list, start_idx, n_samples)
         PS_band, _ = music(a, R_band, phi, L)
         PS_list.append(np.abs(PS_band))
-
     t1 = time.time()
 
     PS_stack = np.stack(PS_list, axis=0)
     PS_agg = np.mean(PS_stack, axis=0) if agg == "mean" else np.median(PS_stack, axis=0)
 
-    # IMPORTANT: peak pick only in [-90, 90]
-    mask = (phi >= -np.pi/2) & (phi <= np.pi/2)
+    mask = (phi >= -np.pi / 2) & (phi <= np.pi / 2)
     phi_in = phi[mask]
     PS_in = PS_agg[mask]
 
@@ -162,27 +238,26 @@ def music_teacher_grouped_covavg(CSI, ant_start, M, groups, start_idx, n_samples
     return PS_agg, doa_deg, music_time
 
 
-
 # --------------------------------------
-# Student graph builder (frequency-only, cov-avg)
+# Student graph builder (list-groups, cov-avg)
 # --------------------------------------
-def build_graph_slice_freq_only_covavg(CSI, ant_start, M, groups, start_idx, n_samples,
-                                       topk=0, trace_norm=True):
+def build_graph_slice_selected_covavg(CSI, ant_start, M, groups_sc, start_idx, n_samples,
+                                      topk=0, trace_norm=True):
     """
-    Nodes: frequency groups
+    Nodes: groups_sc (each group is a list of subcarrier indices)
     Node features: cov-avg over subcarriers in the group (Re/Im)
-    Edges: chain adjacency + optional top-k cosine similarity
+    Edges: chain adjacency + optional top-k cosine similarity (computed from node features)
     """
     node_feats = []
-    for (k0, k1) in groups:
-        R = cov_avg_over_subcarriers(CSI, ant_start, M, k0, k1, start_idx, n_samples)
+    for sc_list in groups_sc:
+        R = cov_avg_over_subcarriers_list(CSI, ant_start, M, sc_list, start_idx, n_samples)
         node_feats.append(cov_to_feature(R, trace_norm=trace_norm))
 
     x_nodes = np.stack(node_feats, axis=0)  # (N,F)
+    N = x_nodes.shape[0]
 
     # chain edges
     edges = []
-    N = x_nodes.shape[0]
     for i in range(N - 1):
         edges += [(i, i + 1), (i + 1, i)]
 
@@ -235,7 +310,7 @@ class AoAGNN(nn.Module):
         x = F.relu(self.conv2(x, edge_index))
         g = self.pool(x, batch)
         out = self.head(g)
-        out = F.normalize(out, dim=1)  # IMPORTANT: keep on unit circle
+        out = F.normalize(out, dim=1)  # keep on unit circle
         return out
 
 
@@ -253,10 +328,6 @@ def vec_to_doa_deg(vec2: np.ndarray):
 
 
 def angular_loss(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-    """
-    pred, target: (B,2) unit vectors
-    returns scalar loss
-    """
     pred = F.normalize(pred, dim=1)
     target = F.normalize(target, dim=1)
     return 1.0 - torch.sum(pred * target, dim=1).mean()
@@ -270,12 +341,10 @@ def load_nokia_track_csi(dataset_dir: str, track: int, ant_max: int = 64, sc_max
     Supports both layouts:
       1) dataset_dir/t{track}/*.mat
       2) dataset_dir/*.mat (files contain t{track}_*.mat)
-
     Expects key 'Hd_all' in each .mat file.
     Returns CSI: complex np.ndarray [ant_max, sc_max, T_concat]
     """
     track_dir = os.path.join(dataset_dir, f"t{track}")
-
     if os.path.isdir(track_dir):
         mat_files = sorted(glob.glob(os.path.join(track_dir, "*.mat")))
     else:
@@ -314,9 +383,17 @@ def main():
     parser.add_argument("--window_size", type=int, default=500)
     parser.add_argument("--stride", type=int, default=100)
 
-    # frequency-only params
-    parser.add_argument("--grouping", type=int, default=10, choices=[0, 5, 10],
-                        help="0=per-subcarrier nodes, 5=5 bands, 10=10 bands")
+    # selection + grouping (NEW)
+    parser.add_argument("--n_select", type=int, default=20,
+                        help="Number of subcarriers to SELECT using correlation (default 20)")
+    parser.add_argument("--group_size", type=int, default=5,
+                        help="Group size (#subcarriers per node) after selection (default 5)")
+    parser.add_argument("--corr_top_p", type=int, default=10,
+                        help="For selection score: mean of top_p similarities per row")
+    parser.add_argument("--max_train_slices_for_corr", type=int, default=200,
+                        help="How many training slices to estimate correlation signatures (default 200)")
+
+    # graph / features
     parser.add_argument("--topk", type=int, default=0, help="0 disables dynamic similarity edges")
     parser.add_argument("--trace_norm", action="store_true", help="trace normalize covariances")
     parser.add_argument("--teacher_agg", type=str, default="mean", choices=["mean", "median"])
@@ -349,16 +426,23 @@ def main():
     row_ant = 0
     ant_start = row_ant * M
 
-    # --- grouping ---
-    K = CSI.shape[1]
-    groups = make_freq_groups(K, args.grouping)
-
+    # --- total slices ---
     total_g = (CSI.shape[2] - n_samples) // interval
     if total_g <= 0:
         raise RuntimeError(f"Not enough CSI length={CSI.shape[2]} for window_size={n_samples} and stride={interval}.")
 
+    # --- sanity for selection/grouping ---
+    K = CSI.shape[1]
+    if args.n_select > K:
+        raise ValueError(f"--n_select {args.n_select} cannot exceed total subcarriers K={K}.")
+    if args.n_select % args.group_size != 0:
+        raise ValueError(f"--n_select {args.n_select} must be divisible by --group_size {args.group_size}.")
+
     # --- output dirs ---
-    results_dir = os.path.join(args.output_dir, f"{args.experiment_name}_group{args.grouping}")
+    results_dir = os.path.join(
+        args.output_dir,
+        f"{args.experiment_name}_sel{args.n_select}_gsize{args.group_size}"
+    )
     data_dir = os.path.join(results_dir, "data")
     gnn_figure_dir = os.path.join(results_dir, "gnn_figure")
     gnn_data_dir = os.path.join(results_dir, "gnn_data")
@@ -366,18 +450,59 @@ def main():
     os.makedirs(gnn_figure_dir, exist_ok=True)
     os.makedirs(gnn_data_dir, exist_ok=True)
 
+    # --------------------------------------
+    # CORRELATION-BASED SELECTION + GROUPING
+    #   - compute signatures from TRAIN ONLY (start_idx < start_sample)
+    #   - build abs-corr similarity matrix
+    #   - select n_select strongest
+    #   - greedy group into groups of group_size (e.g., 4 groups of 5)
+    # --------------------------------------
+    print("[INFO] Computing train-only subcarrier signatures for correlation selection...")
+    sigs = compute_subcarrier_signatures_trainonly(
+        CSI=CSI,
+        ant_start=ant_start,
+        M=M,
+        n_samples=n_samples,
+        interval=interval,
+        start_sample=args.start_sample,
+        max_train_slices=args.max_train_slices_for_corr,
+        trace_norm=args.trace_norm
+    )
+    sim = corr_similarity_matrix(sigs, use_abs=True)
+
+    selected, scores = select_strong_subcarriers(sim, n_select=args.n_select, top_p=args.corr_top_p)
+    groups_sc = greedy_group_by_similarity(selected, sim, group_size=args.group_size)
+
+    print(f"[INFO] Selected subcarriers (n={len(selected)}): {selected}")
+    print(f"[INFO] Groups ({len(groups_sc)} groups x {args.group_size}): {groups_sc}")
+
+    # save selection/groups for reproducibility
+    with open(os.path.join(gnn_data_dir, "selection_groups.json"), "w") as fjs:
+        json.dump(
+            {
+                "n_select": args.n_select,
+                "group_size": args.group_size,
+                "corr_top_p": args.corr_top_p,
+                "max_train_slices_for_corr": args.max_train_slices_for_corr,
+                "selected_subcarriers": selected,
+                "groups_sc": groups_sc,
+            },
+            fjs,
+            indent=2
+        )
+
     train_graphs, test_graphs, test_meta = [], [], []
 
     # --- slicing loop ---
     for g in range(total_g):
         start_idx = g * interval
 
-        # --- grouped MUSIC teacher (cov-avg) ---
-        PS_teacher, doa_deg, music_time = music_teacher_grouped_covavg(
+        # --- grouped MUSIC teacher (list-groups, cov-avg) ---
+        PS_teacher, doa_deg, music_time = music_teacher_grouped_covavg_listgroups(
             CSI=CSI,
             ant_start=ant_start,
             M=M,
-            groups=groups,
+            groups_sc=groups_sc,
             start_idx=start_idx,
             n_samples=n_samples,
             phi=phi,
@@ -399,16 +524,17 @@ def main():
                 "phi": phi_range,
                 "music_grouped": spec_music,
                 "doa_music_deg": doa_deg,
-                "grouping": args.grouping,
+                "selected_subcarriers": np.array(selected, dtype=np.int32),
+                "groups_sc": np.array(groups_sc, dtype=np.int32),
             },
         )
 
-        # --- build frequency-only graph (cov-avg features) ---
-        x_nodes, edge_index = build_graph_slice_freq_only_covavg(
+        # --- build frequency-only graph from SELECTED groups (cov-avg features) ---
+        x_nodes, edge_index = build_graph_slice_selected_covavg(
             CSI=CSI,
             ant_start=ant_start,
             M=M,
-            groups=groups,
+            groups_sc=groups_sc,
             start_idx=start_idx,
             n_samples=n_samples,
             topk=args.topk,
@@ -465,10 +591,15 @@ def main():
             "in_dim": in_dim,
             "hidden": 128,
             "use_gat": args.use_gat,
-            "grouping": args.grouping,
             "topk": args.topk,
             "trace_norm": args.trace_norm,
             "teacher_agg": args.teacher_agg,
+            "n_select": args.n_select,
+            "group_size": args.group_size,
+            "selected_subcarriers": selected,
+            "groups_sc": groups_sc,
+            "corr_top_p": args.corr_top_p,
+            "max_train_slices_for_corr": args.max_train_slices_for_corr,
         },
         ckpt_path,
     )
@@ -507,7 +638,9 @@ def main():
                 "squared_error": sq_err,
                 "gnn_infer_time": gnn_time_per_slice,
                 "music_time": mus_time,
-                "grouping": args.grouping,
+                "n_select": args.n_select,
+                "group_size": args.group_size,
+                "num_groups": len(groups_sc),
             }
         )
 
@@ -523,7 +656,7 @@ def main():
         plt.ylabel("Spectrum (normalized)")
         plt.legend()
         plt.grid(True)
-        plt.title(f"Slice {g} | group={args.grouping}")
+        plt.title(f"Slice {g} | sel={args.n_select} | groups={len(groups_sc)}")
         plt.tight_layout()
         plt.savefig(os.path.join(gnn_figure_dir, f"slice_{g}_gnn_music_comparison.png"))
         plt.close()
@@ -536,7 +669,7 @@ def main():
     plt.plot(df["slice"], df["gnn_infer_time"], label="GNN Inference Time per Slice")
     plt.xlabel("Slice")
     plt.ylabel("Time (seconds)")
-    plt.title(f"Time: MUSIC Teacher vs GNN (group={args.grouping})")
+    plt.title(f"Time: MUSIC Teacher vs GNN (sel={args.n_select}, groups={len(groups_sc)})")
     plt.legend()
     plt.grid(True)
     plt.tight_layout()
@@ -546,7 +679,7 @@ def main():
     plt.figure()
     plt.plot(df["gnn_doa"].values, label="GNN Prediction")
     plt.plot(df["music_doa"].values, label="MUSIC Teacher")
-    plt.title(f"GNN vs MUSIC Teacher DoA (group={args.grouping})")
+    plt.title(f"GNN vs MUSIC Teacher DoA (sel={args.n_select}, groups={len(groups_sc)})")
     plt.xlabel("Test Slice Index")
     plt.ylabel("DoA (degrees)")
     plt.legend()
@@ -558,8 +691,10 @@ def main():
     mae = float(df["abs_error"].mean())
     rmse = float(np.sqrt(df["squared_error"].mean()))
     print(f"[DONE] Saved under: {results_dir}")
-    print(f"[SUMMARY] grouping={args.grouping} | MAE={mae:.4f} deg | RMSE={rmse:.4f} deg | "
-          f"GNN time/slice={gnn_time_per_slice:.6f}s")
+    print(
+        f"[SUMMARY] sel={args.n_select} | group_size={args.group_size} | num_groups={len(groups_sc)} "
+        f"| MAE={mae:.4f} deg | RMSE={rmse:.4f} deg | GNN time/slice={gnn_time_per_slice:.6f}s"
+    )
 
 
 if __name__ == "__main__":
