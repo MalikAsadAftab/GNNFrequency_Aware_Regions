@@ -1,0 +1,65 @@
+{
+  "selection_method": "fim",
+  "n_select": 20,
+  "group_size": 5,
+  "selected_subcarriers": [
+    12,
+    46,
+    13,
+    11,
+    6,
+    45,
+    47,
+    48,
+    34,
+    30,
+    7,
+    28,
+    5,
+    14,
+    2,
+    33,
+    31,
+    10,
+    43,
+    32
+  ],
+  "groups_sc": [
+    [
+      31,
+      32,
+      30,
+      33,
+      34
+    ],
+    [
+      6,
+      5,
+      7,
+      12,
+      10
+    ],
+    [
+      28,
+      2,
+      46,
+      11,
+      14
+    ],
+    [
+      13,
+      47,
+      48,
+      45,
+      43
+    ]
+  ],
+  "trace_norm": true,
+  "topk_edges": 2,
+  "teacher_agg": "mean",
+  "max_train_slices_for_selection": 200,
+  "corr_top_p": 10,
+  "dopt_proj_dim": 32,
+  "dopt_eps": 1e-06,
+  "dopt_seed": 7
+}

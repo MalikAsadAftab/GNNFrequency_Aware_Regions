@@ -1,0 +1,41 @@
+{
+  "selection_method": "dopt",
+  "n_select": 10,
+  "group_size": 5,
+  "selected_subcarriers": [
+    44,
+    0,
+    48,
+    12,
+    23,
+    41,
+    3,
+    34,
+    20,
+    31
+  ],
+  "groups_sc": [
+    [
+      20,
+      23,
+      3,
+      44,
+      31
+    ],
+    [
+      34,
+      12,
+      48,
+      41,
+      0
+    ]
+  ],
+  "trace_norm": true,
+  "topk_edges": 2,
+  "teacher_agg": "mean",
+  "max_train_slices_for_selection": 200,
+  "corr_top_p": 10,
+  "dopt_proj_dim": 32,
+  "dopt_eps": 1e-06,
+  "dopt_seed": 7
+}

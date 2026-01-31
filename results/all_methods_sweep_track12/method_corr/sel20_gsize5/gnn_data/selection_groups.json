@@ -1,0 +1,65 @@
+{
+  "selection_method": "corr",
+  "n_select": 20,
+  "group_size": 5,
+  "selected_subcarriers": [
+    22,
+    6,
+    4,
+    8,
+    18,
+    19,
+    17,
+    35,
+    9,
+    27,
+    14,
+    12,
+    30,
+    31,
+    16,
+    33,
+    10,
+    21,
+    38,
+    20
+  ],
+  "groups_sc": [
+    [
+      18,
+      17,
+      16,
+      19,
+      14
+    ],
+    [
+      22,
+      21,
+      20,
+      4,
+      27
+    ],
+    [
+      6,
+      8,
+      9,
+      12,
+      10
+    ],
+    [
+      31,
+      30,
+      33,
+      35,
+      38
+    ]
+  ],
+  "trace_norm": true,
+  "topk_edges": 2,
+  "teacher_agg": "mean",
+  "max_train_slices_for_selection": 200,
+  "corr_top_p": 10,
+  "dopt_proj_dim": 32,
+  "dopt_eps": 1e-06,
+  "dopt_seed": 7
+}
